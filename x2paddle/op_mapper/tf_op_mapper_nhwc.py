@@ -51,7 +51,8 @@ class TFOpMapperNHWC(OpMapper):
             'alpha': 'alpha'
         }],
         'Floor': ['floor'],
-        'Erf': ['erf']
+        'Erf': ['erf'],
+        'Square': ['square']
     }
     elementwise_ops = {
         'Add': 'elementwise_add',
@@ -145,8 +146,19 @@ class TFOpMapperNHWC(OpMapper):
         op_type = self.elementwise_ops[node.layer_type]
         x = self.graph.get_node(node.layer.input[0])
         y = self.graph.get_node(node.layer.input[1])
+
         program.add_layer(
             kernel="fluid.layers.{}".format(op_type),
+            inputs={"x": x.name,
+                    "y": y.name},
+            outputs=[node.name])
+
+    def NotEqual(self, node):
+        x = self.graph.get_node(node.layer.input[0])
+        y = self.graph.get_node(node.layer.input[1])
+
+        program.add_layer(
+            kernel="fluid.layers.not_equal",
             inputs={"x": x.name,
                     "y": y.name},
             outputs=[node.name])
@@ -172,6 +184,8 @@ class TFOpMapperNHWC(OpMapper):
         if len(shape) == 0:
             assert value.size == 1, "Unexpected situation happend"
             shape = [1]
+            if value == float('inf'):
+                value = "float('inf')"
             initializer = "Constant({})".format(value)
 
         program.parameters[node.name] = node.value
@@ -441,17 +455,28 @@ class TFOpMapperNHWC(OpMapper):
     def Reshape(self, node):
         input = self.graph.get_node(node.layer.input[0])
         param = self.graph.get_node(node.layer.input[1])
+
+        input_name = input.name
+        if input.dtype == 'bool':
+            cast_name = gen_name('reshape', 'cast')
+            program.add_layer(
+                kernel="fluid.layers.cast",
+                inputs={"x": input_name},
+                outputs=[cast_name],
+                dtype="'int32'")
+            input_name = cast_name
+
         if param.layer_type == "Const":
             shape = param.value.tolist()
             program.add_layer(
                 kernel="fluid.layers.reshape",
-                inputs={"x": input.name},
+                inputs={"x": input_name},
                 outputs=[node.name],
                 shape=shape)
         else:
             program.add_layer(
                 kernel="fluid.layers.reshape",
-                inputs={"x": input.name,
+                inputs={"x": input_name,
                         "shape": param.name},
                 outputs=[node.name])
         if param.layer_type != "Const":
@@ -463,6 +488,13 @@ class TFOpMapperNHWC(OpMapper):
                     inputs={"x": node.name},
                     outputs=[node.name],
                     shape=out_shape.tolist())
+
+        if input.dtype == 'bool':
+            program.add_layer(
+                kernel="fluid.layers.cast",
+                inputs={"x": node.name},
+                outputs=[node.name],
+                dtype="'bool'")
 
     def Pad(self, node):
         input = self.graph.get_node(node.layer.input[0])
@@ -517,9 +549,18 @@ class TFOpMapperNHWC(OpMapper):
 
     def Shape(self, node):
         input = self.graph.get_node(node.layer.input[0])
+        input_name = input.name
+        if input.dtype == 'bool':
+            cast_name = gen_name('shape', 'cast')
+            program.add_layer(
+                kernel="fluid.layers.cast",
+                inputs={"x": input.name},
+                outputs=[cast_name],
+                dtype="'int32'")
+            input_name = cast_name
         program.add_layer(
             kernel="fluid.layers.shape",
-            inputs={"input": input.name},
+            inputs={"input": input_name},
             outputs=[node.name])
 
     def ArgMax(self, node):
@@ -642,12 +683,43 @@ class TFOpMapperNHWC(OpMapper):
 
     def Pack(self, node):
         inputs = [self.graph.get_node(name) for name in node.layer.input]
+        input_names = [i.name for i in inputs]
         axis = node.get_attr("axis")
         program.add_layer(
             kernel="fluid.layers.stack",
-            inputs={"x": [i.name for i in inputs]},
+            inputs={"x": input_names},
             outputs=[node.name],
             axis=axis)
+        if len(node.out_shapes[0]) == 1:
+            program.add_layer(
+                kernel="fluid.layers.reshape",
+                inputs={"x": node.name},
+                outputs=[node.name],
+                shape=[-1])
+
+    def Unpack(self, node):
+        input = self.graph.get_node(node.layer.input[0])
+        axis = node.get_attr("axis")
+        num = node.get_attr("num")
+        shape = input.out_shapes[0]
+        input_name = input.name
+        if len(shape) == 1:
+            if shape[0] > 0 and num == shape[0]:
+                program.add_layer(
+                    kernel="fluid.layers.unsqueeze",
+                    inputs={"input": input.name},
+                    outputs=[node.name],
+                    axes=[0])
+                input_name = node.name
+                axis = 1
+            else:
+                raise Exception("Unexpected situation happend in Unpack OP")
+        program.add_layer(
+            kernel="fluid.layers.unstack",
+            inputs={"x": input_name},
+            outputs=["{}_p{}".format(node.layer_name, i) for i in range(num)],
+            axis=axis,
+            num=num)
 
     def ConcatV2(self, node):
         inputs = [self.graph.get_node(name) for name in node.layer.input[:-1]]
@@ -656,27 +728,55 @@ class TFOpMapperNHWC(OpMapper):
         axis = axis.value
         if axis < 0:
             axis += len(inputs[0].out_shapes[0])
+
+        input_names = [i.name for i in inputs]
+        for i, ipt in enumerate(inputs):
+            if node.dtype == 'bool':
+                cast_name = gen_name('concat', 'cast')
+                program.add_layer(
+                    kernel="fluid.layers.cast",
+                    inputs={"x": ipt.name},
+                    outputs=[cast_name],
+                    dtype="'int32'")
+                input_names[i] = cast_name
         program.add_layer(
             kernel="fluid.layers.concat",
-            inputs={"input": [i.name for i in inputs]},
+            inputs={"input": input_names},
             outputs=[node.name],
             axis=axis)
+        if node.dtype == 'bool':
+            program.add_layer(
+                kernel="fluid.layers.cast",
+                inputs={"x": node.name},
+                outputs=[node.name],
+                dtype="'bool'")
 
     def StridedSlice(self, node):
         input = self.graph.get_node(node.layer.input[0])
         begin = self.graph.get_node(node.layer.input[1])
         end = self.graph.get_node(node.layer.input[2])
         strides = self.graph.get_node(node.layer.input[3])
-        assert begin.layer_type == "Const"
-        assert end.layer_type == "Const"
-        assert strides.layer_type == "Const"
-        strides = strides.value.tolist()
+
+        if strides.layer_type == "Const":
+            strides = strides.value.tolist()
+        else:
+            strides = self.decoder.infer_shape_tensor(strides)
+        if begin.layer_type == "Const":
+            begin = begin.value.tolist()
+        else:
+            begin = self.decoder.infer_shape_tensor(begin)
+        if end.layer_type == "Const":
+            end = end.value.tolist()
+        else:
+            end = self.decoder.infer_shape_tensor(end)
+
         assert len(set(strides)) == 1 and strides[
             0] == 1, "Only support strides be 1 in StridedSlice OP"
 
-        begin = begin.value.tolist()
-        end = end.value.tolist()
-
+        if len(begin) < len(input.out_shapes[0]):
+            begin = begin + [0] * (len(input.out_shapes[0]) - len(begin))
+        if len(end) < len(input.out_shapes[0]):
+            end = end + [0] * (len(input.out_shapes[0]) - len(end))
         for i in range(len(end)):
             if end[i] == 0:
                 end[i] = 999999
@@ -736,10 +836,10 @@ class TFOpMapperNHWC(OpMapper):
                 pass
             else:
                 program.add_layer(
-                    kernel="fluid.layers.unsqueeze",
+                    kernel="fluid.layers.squeeze",
                     inputs={"input": node.name},
                     outputs=[node.name],
-                    axes=new_axes)
+                    axes=shrink_axes)
 
     def Split(self, node):
         dim = self.graph.get_node(node.layer.input[0])
@@ -1099,6 +1199,8 @@ class TFOpMapperNHWC(OpMapper):
             outputs=[node.name],
             **attr)
 
+        node.layer.attr['dtype'].type = 10
+
     def GatherV2(self, node):
         embeddings = self.graph.get_node(node.layer.input[0])
         index = self.graph.get_node(node.layer.input[1])
@@ -1121,6 +1223,13 @@ class TFOpMapperNHWC(OpMapper):
             inputs=inputs,
             outputs=[node.name],
             overwrite=False)
+        if len(index.out_shapes[0]) != 1:
+            out_shape = node.out_shapes[0]
+            program.add_layer(
+                kernel="fluid.layers.reshape",
+                inputs={"x": node.name},
+                outputs=[node.name],
+                shape=out_shape)
 
     def ExpandDims(self, node):
         x = self.graph.get_node(node.layer.input[0], copy=True)

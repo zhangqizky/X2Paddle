@@ -15,8 +15,11 @@
 from __future__ import print_function
 from __future__ import division
 import paddle.fluid as fluid
+from paddle.fluid.initializer import Constant
+from paddle.fluid.param_attr import ParamAttr
 from paddle.fluid.proto import framework_pb2
 from collections import OrderedDict
+import copy
 import numpy
 import time
 import collections
@@ -57,6 +60,29 @@ class PaddleLayer(object):
         block.father_layer = self
         self.blocks.append(block)
 
+    def get_code(self, with_outputs=True):
+        code = ""
+
+        #        if len(self.outputs) == 1:
+        #            code = self.outputs[0]
+        #        else:
+        #            for output in self.outputs:
+        #                code += "{}, ".format(output)
+        #            code = code.strip(", ")
+        #        code += " = "
+
+        code += "{}(".format(self.kernel)
+        for k, v in self.inputs.items():
+            if isinstance(v, list):
+                code += "{}=[{}], ".format(k, ", ".join(v))
+            else:
+                code += "{}={}, ".format(k, v)
+        for k, v in self.attrs.items():
+            code += "{}={}, ".format(k, v)
+        code = code.strip(", ")
+        code += ")"
+        return code
+
 
 class PaddleProgram(object):
     def __init__(self):
@@ -80,9 +106,58 @@ class PaddleProgram(object):
         layer = PaddleLayer(kernel, inputs, outputs, **kwargs)
         layer_id = str(len(self.layers))
         if self.father_layer is not None:
-            layer_id = "{}.{}.{}".format(layer_id, len(self.father_layer.blocks()), self.father_layer.id)
+            layer_id = "{}.{}.{}".format(layer_id,
+                                         len(self.father_layer.blocks()),
+                                         self.father_layer.id)
         self.layers[layer_id] = layer
         return layer_id
+
+    def del_layer(self, layer_id):
+        layer = self.layers[layer_id]
+        outputs = self.edges_out.get(layer_id, [])
+        inputs = self.edges_in.get(layer_id, [])
+
+        assert len(
+            inputs) <= 1, "There should be 0 or 1 input for deleted layer."
+
+        if len(inputs) == 0:
+            for out in outputs:
+                while layer_id in self.edges_in[out]:
+                    index = self.edges_in[out].index(layer_id)
+                    del self.edges_in[out][index]
+
+                input_keys = list(self.layers[out].inputs.keys())
+                for k in input_keys:
+                    if self.layers[out].inputs[k] == layer.outputs[0]:
+                        del self.layers[out].inputs[k]
+
+            del self.layers[layer_id]
+            if layer_id in self.edges_in:
+                del self.edges_in[layer_id]
+            if layer_id in self.edges_out:
+                del self.edges_out[layer_id]
+            return
+
+        # 将所有输出layer的输入layer进行替换
+        for out in outputs:
+            for i in range(len(self.edges_in[out])):
+                if self.edges_in[out][i] == layer_id:
+                    self.edges_in[out][i] = inputs[0]
+
+        # 将输出layer赋给输入layer的输出
+        replace_index = self.edges_out[inputs[0]].index(layer_id)
+        del self.edges_out[inputs[0]][replace_index]
+        for i, out in enumerate(outputs):
+            self.edges_out[inputs[0]].insert(replace_index + i, out)
+            for k, v in self.layers[out].inputs.items():
+                if v == layer.outputs[0]:
+                    self.layers[out].inputs[k] = list(layer.inputs.values())[0]
+
+        del self.layers[layer_id]
+        if layer_id in self.edges_out:
+            del self.edges_out[layer_id]
+        if layer_id in self.edges_in:
+            del self.edges_in[layer_id]
 
     def build(self):
         outputs_from_nodes = dict()
@@ -104,6 +179,12 @@ class PaddleProgram(object):
                     self.edges_in[layer_id].append(in_layer_id)
             for output in layer.outputs:
                 outputs_from_nodes[output] = layer_id
+
+        layer_ids = copy.deepcopy(list(self.layers.keys()))
+        for layer_id in layer_ids:
+            if len(self.edges_in.get(layer_id, [])) == 0 and len(
+                    self.edges_out.get(layer_id, [])) == 0:
+                del self.layers[layer_id]
 
     def gen_code(self, code_dir):
         def write_code(f, code_list, indent=0):
@@ -193,6 +274,13 @@ class PaddleProgram(object):
                     feeded_var_names=[i.name for i in inputs],
                     target_vars=outputs,
                     executor=exe)
+        print("Model has been converted, saved in {}".format(save_dir))
+        print("=====Model inputs info=====")
+        for ipt in self.inputs:
+            print("Tensor: {}".format(ipt))
+        print("=====Model outputs info====")
+        for out in self.outputs:
+            print("Tensor: {}".format(out))
 
     def dump_parameter(self, param_name, param, save_dir):
         if not os.path.exists(save_dir):
@@ -227,3 +315,19 @@ class PaddleProgram(object):
         fp.write(tensor_desc.SerializeToString())
         param.tofile(fp)
         fp.close()
+
+    def visualize(self, save_dir):
+        from graphviz import Digraph
+        dot = Digraph("PaddleGraph", "Generated by X2Paddle")
+        for layer_id, layer in self.layers.items():
+            dot.node(layer_id, layer.kernel)
+
+        for layer_id, outputs in self.edges_out.items():
+            for out in outputs:
+                dot.edge(layer_id, out)
+
+        with open(os.path.join(save_dir, 'graph.dot'), 'w') as f:
+            f.write(dot.source)
+
+        dot.format = 'svg'
+        dot.render(filename='graph', directory=save_dir)

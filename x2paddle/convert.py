@@ -118,13 +118,21 @@ def tf2paddle(model_path,
     from x2paddle.op_mapper.tf_op_mapper import TFOpMapper
     from x2paddle.op_mapper.tf_op_mapper_nhwc import TFOpMapperNHWC
     from x2paddle.optimizer.tf_optimizer import TFOptimizer
+    from x2paddle.optimizer.transpose import TransposeOpt
+    from x2paddle.optimizer.bias import BiasOpt
 
     print("Now translating model from tensorflow to paddle.")
     model = TFDecoder(model_path, define_input_shape=define_input_shape)
 
     mapper = TFOpMapperNHWC(model)
     program.build()
+    opt = BiasOpt()
+    opt.run(program)
+    opt = TransposeOpt()
+    opt.run(program)
+
     program.gen_model(save_dir)
+    program.visualize(save_dir)
 
 
 def caffe2paddle(proto, weight, save_dir, caffe_proto, params_merge=False):

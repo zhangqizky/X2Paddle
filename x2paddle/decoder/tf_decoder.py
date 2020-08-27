@@ -60,7 +60,7 @@ class TFGraphNode(GraphNode):
 
     @property
     def dtype(self):
-        keys = ['dtype', 'Tidx', 'T', 'DstT']
+        keys = ['dtype', 'T', 'DstT', 'Tidx']
         for k in keys:
             dtype = self.layer.attr[k].type
             if dtype > 0:
@@ -74,7 +74,7 @@ class TFGraphNode(GraphNode):
 
     @property
     def raw_dtype(self):
-        keys = ['dtype', 'Tidx', 'T', 'DstT']
+        keys = ['dtype', 'T', 'DstT', 'Tidx']
         for k in keys:
             dtype = self.layer.attr[k].type
             if dtype > 0:
@@ -121,7 +121,7 @@ class TFGraph(Graph):
     def __init__(self, model, data_format="NHWC"):
         super(TFGraph, self).__init__(model)
         self.identity_map = dict()
-        self.multi_out_ops = ['Split', 'SplitV', 'IteratorV2']
+        self.multi_out_ops = ['Split', 'SplitV', 'IteratorV2', 'Unpack']
         self.tf_data_format = data_format
 
     def build(self):
@@ -159,6 +159,7 @@ class TFGraph(Graph):
                         del self.output_nodes[idx]
 
         # tensorflow graph optimize
+        self._get_inputs_outputs()
         self._remove_isolated_node()
         self._optimize_dialiation_conv()
         self._remove_identity_node()
@@ -167,9 +168,11 @@ class TFGraph(Graph):
     def get_node(self, node_name, copy=False):
         items = node_name.strip().split(':')
         items[0] = items[0].replace('/', '_').replace('-', '_')
+
         if items[0] in self.identity_map:
-            items[0] = self.identity_map[items[0]]
-        new_node_name = ":".join(items)
+            new_node_name = self.identity_map[items[0]]
+        else:
+            new_node_name = ":".join(items)
         node = super(TFGraph, self).get_node(new_node_name, copy)
         if node is None:
             return None
@@ -199,6 +202,27 @@ class TFGraph(Graph):
 
         idx = self.topo_sort.index(node_name)
         del self.topo_sort[idx]
+
+    def _get_inputs_outputs(self):
+        node_inputs_info = dict()
+        node_outputs_info = dict()
+        self.input_nodes = list()
+        self.output_nodes = list()
+        for node in self.model.node:
+            inputs = [ipt.split(':')[0].replace('^', '') for ipt in node.input]
+            node_inputs_info[node.name] = inputs
+            for ipt in inputs:
+                if ipt not in node_outputs_info:
+                    node_outputs_info[ipt] = list()
+                node_outputs_info[ipt].append(node.name)
+        for node in self.model.node:
+            if node.op == "Placeholder":
+                self.input_nodes.append(
+                    node.name.replace('/', '_').replace('-', '_'))
+            if len(node_inputs_info.get(node.name, [])) > 0 and len(
+                    node_outputs_info.get(node.name, [])) == 0:
+                self.output_nodes.append(
+                    node.name.replace('/', '_').replace('-', '_'))
 
     def _optimize_dialiation_conv(self):
         for name in list(self.node_map.keys()):
@@ -268,6 +292,14 @@ class TFGraph(Graph):
                 idx = self.output_nodes.index(node_name)
                 self.output_nodes[idx] = input_node.layer_name
 
+        for i, out in enumerate(cp.deepcopy(self.output_nodes)):
+            if out not in self.node_map:
+                index = self.output_nodes.index(out)
+                del self.output_nodes[index]
+            elif len(self.node_map[out].layer.input) == 0:
+                index = self.output_nodes.index(out)
+                del self.output_nodes[index]
+
     def _remove_cast_node(self):
         cast_node = list()
         for node_name, node in self.node_map.items():
@@ -288,16 +320,6 @@ class TFGraph(Graph):
             if node_name in self.output_nodes:
                 idx = self.output_nodes.index(node_name)
                 self.output_nodes[idx] = input_node.layer_name
-
-    def data_format_propagation(self, node):
-        current_node = self.node_map[node.layer_name]
-        outputs = current_node.outputs
-        if len(outputs) == 0:
-            return
-        for out in outputs:
-            next_node = self.node_map[out]
-            next_node.tf_data_format = node.tf_data_format
-            self.data_format_propagation(next_node)
 
 
 class TFDecoder(object):
