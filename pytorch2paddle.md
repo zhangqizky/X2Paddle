@@ -39,11 +39,11 @@ from torchvision.models.utils import load_state_dict_from_url
 # 构建输入
 input_data = np.random.rand(1, 3, 224, 224).astype("float32")
 # 获取PyTorch Module
-torch_module = AlexNet()
+torch_model = AlexNet()
 torch_state_dict = load_state_dict_from_url('https://download.pytorch.org/models/alexnet-owt-4df8aa71.pth')
-torch_module.load_state_dict(torch_state_dict)
+torch_model.load_state_dict(torch_state_dict)
 # 设置为eval模式
-torch_module.eval()
+torch_model.eval()
 # 进行转换
 from x2paddle.convert import pytorch2paddle
 pytorch2paddle(torch_model, 
